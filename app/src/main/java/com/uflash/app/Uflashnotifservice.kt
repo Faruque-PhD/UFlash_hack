@@ -29,26 +29,17 @@ class UFlashNotifService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        android.util.Log.d("UFlashNotif", "Service: onCreate")
         // Create channel first — must exist before any notification is posted
         createChannel()
-
-        // Build MediaSession
-        mediaSession = MediaSessionCompat(this, "UFlash").apply {
-            setPlaybackState(
-                PlaybackStateCompat.Builder()
-                    .setState(PlaybackStateCompat.STATE_PLAYING, 0L, 1f)
-                    .setActions(
-                        PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
-                                PlaybackStateCompat.ACTION_PLAY or
-                                PlaybackStateCompat.ACTION_SKIP_TO_NEXT
-                    ).build()
-            )
+...
             isActive = true
         }
 
         // FIX: Call startForeground() immediately in onCreate so Android 12+
         // does not kill the service before onStartCommand fires.
         val placeholder = buildNotification("READY", "H")
+        android.util.Log.d("UFlashNotif", "Service: Starting foreground")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIF_ID, placeholder, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
         } else {
@@ -59,13 +50,17 @@ class UFlashNotifService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val label = intent?.getStringExtra(EXTRA_LABEL) ?: "READY"
         val code  = intent?.getStringExtra(EXTRA_CODE)  ?: "H"
+        android.util.Log.d("UFlashNotif", "Service: onStartCommand label=$label code=$code")
         // Update the already-posted foreground notification with real content
         val notif = buildNotification(label, code)
         getSystemService(NotificationManager::class.java).notify(NOTIF_ID, notif)
         return START_STICKY
     }
 
-    override fun onDestroy() { mediaSession?.release(); super.onDestroy() }
+    override fun onDestroy() { 
+        android.util.Log.d("UFlashNotif", "Service: onDestroy")
+        mediaSession?.release(); super.onDestroy() 
+    }
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun buildNotification(cmdLabel: String, cmdCode: String): Notification {

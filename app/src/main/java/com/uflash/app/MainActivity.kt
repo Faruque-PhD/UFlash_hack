@@ -206,20 +206,26 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Log.d(TAG, "Lifecycle: onCreate")
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.statusBarColor = Color.parseColor(BG)
         camManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
         torchCamId = findTorchId()
         rxCamId    = findBackCamId()
+        Log.d(TAG, "Hardware: torchCamId=$torchCamId, rxCamId=$rxCamId")
         buildUI()
         setupListeners()
-        if (!hasPerm()) ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), PERM)
+        if (!hasPerm()) {
+            Log.d(TAG, "Permissions: Requesting CAMERA permission")
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), PERM)
+        }
         requestNotifPermission()
         showTxMode()
     }
 
     override fun onResume() {
         super.onResume()
+        Log.d(TAG, "Lifecycle: onResume")
         // Guard against double-registration on rapid lifecycle events
         if (!isReceiverRegistered) {
             val filter = IntentFilter().apply {
@@ -232,6 +238,7 @@ class MainActivity : AppCompatActivity() {
             else
                 registerReceiver(notifReceiver, filter)
             isReceiverRegistered = true
+            Log.d(TAG, "Broadcast: Receiver registered")
         }
         // Launch / refresh notification with current selected command
         pushNotification()
@@ -239,8 +246,14 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
+        Log.d(TAG, "Lifecycle: onPause")
         if (isReceiverRegistered) {
-            try { unregisterReceiver(notifReceiver) } catch (_: Exception) {}
+            try { 
+                unregisterReceiver(notifReceiver)
+                Log.d(TAG, "Broadcast: Receiver unregistered")
+            } catch (e: Exception) {
+                Log.e(TAG, "Broadcast: Unregister failed", e)
+            }
             isReceiverRegistered = false
         }
         // Service stays alive so lock-screen controls remain usable.
@@ -249,6 +262,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
+        Log.d(TAG, "Lifecycle: onNewIntent action=${intent?.action}")
         // Called by NotifActionReceiver when app is brought back from background
         intent ?: return
         when (intent.action) {
@@ -265,6 +279,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        Log.d(TAG, "Lifecycle: onDestroy")
         closeCam(); stopTorch(); txExecutor.shutdown()
         cameraThread.quitSafely(); cancelReadyCountdown()
         stopNotifService()
@@ -272,6 +287,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onRequestPermissionsResult(rc: Int, p: Array<String>, gr: IntArray) {
         super.onRequestPermissionsResult(rc, p, gr)
+        Log.d(TAG, "Permissions: result rc=$rc, granted=${gr.getOrNull(0) == PackageManager.PERMISSION_GRANTED}")
         when (rc) {
             PERM      -> if (gr.isNotEmpty() && gr[0] == PackageManager.PERMISSION_GRANTED
                 && !isTxMode) waitForSurfaceThenOpen()
@@ -677,12 +693,26 @@ class MainActivity : AppCompatActivity() {
     // ═════════════════════════════════════════════════════════════════════
 
     private fun startTx() {
-        if (isTransmitting.get()) return
+        if (isTransmitting.get()) {
+            Log.d(TAG, "TX: Already transmitting, ignoring request")
+            return
+        }
         // Guard against submission to a shut-down executor (e.g. called after onDestroy)
-        if (txExecutor.isShutdown) return
+        if (txExecutor.isShutdown) {
+            Log.w(TAG, "TX: Executor shutdown, cannot transmit")
+            return
+        }
         val msg = etMsg.text.toString()
-        if (msg.isEmpty()) { Toast.makeText(this, "Enter a message", Toast.LENGTH_SHORT).show(); return }
-        if (torchCamId == null) { Toast.makeText(this, "No torch", Toast.LENGTH_SHORT).show(); return }
+        if (msg.isEmpty()) {
+            Log.w(TAG, "TX: Empty message")
+            Toast.makeText(this, "Enter a message", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (torchCamId == null) {
+            Log.e(TAG, "TX: No torch camera ID found")
+            Toast.makeText(this, "No torch", Toast.LENGTH_SHORT).show()
+            return
+        }
 
         val bytes = msg.toByteArray(Charsets.UTF_8)
         val bits  = bytes.flatMap { b -> FourB5B.encodeByte(b.toInt() and 0xFF) }
@@ -693,38 +723,61 @@ class MainActivity : AppCompatActivity() {
         pbTx.max = bits.size; pbTx.progress = 0; pbTx.visibility = View.VISIBLE
         tvTxStatus.text = "◎  ${bits.size} BITS  ·  ~${estMs}ms"
         tvTxStatus.setTextColor(c(AMBER))
-        Log.d(TAG, "TX '$msg' → ${bits.size} bits  est=${estMs}ms")
+        Log.d(TAG, "TX: Starting '$msg' (${bytes.size} bytes) → ${bits.size} bits. Est duration: ${estMs}ms")
 
         txExecutor.execute {
             try {
                 val txStart = System.currentTimeMillis()
+                Log.d(TAG, "TX: START sequence (${START_MS}ms)")
                 torch(true); sleepUntil(txStart + START_MS); torch(false)
+                
                 val dataStart = txStart + START_MS
                 bits.forEachIndexed { i, bit ->
-                    sleepUntil(dataStart + i * BIT_MS); torch(bit == 1)
+                    sleepUntil(dataStart + i * BIT_MS)
+                    torch(bit == 1)
+                    Log.v(TAG, "TX: Bit $i = $bit at ${System.currentTimeMillis() - dataStart}ms")
                     mainHandler.post { pbTx.progress = i + 1; tvTxProgress.text = "BIT ${i + 1} / ${bits.size}" }
                 }
+                
                 val stopStart = dataStart + bits.size * BIT_MS
-                sleepUntil(stopStart); torch(false); sleepUntil(stopStart + STOP_MS)
+                sleepUntil(stopStart)
+                Log.d(TAG, "TX: STOP sequence (${STOP_MS}ms)")
+                torch(false); sleepUntil(stopStart + STOP_MS)
+                
+                val actualDur = System.currentTimeMillis() - txStart
+                Log.d(TAG, "TX: Completed in ${actualDur}ms")
+                
                 mainHandler.post {
                     tvTxStatus.text = "●  SENT  ·  ${bits.size} BITS"; tvTxStatus.setTextColor(c(RX))
                     tvTxProgress.text = ""; btnSend.isEnabled = true; btnSend.text = "⚡   TRANSMIT"
                     pbTx.visibility = View.GONE
                 }
             } catch (e: Exception) {
+                Log.e(TAG, "TX: Error during transmission", e)
                 mainHandler.post {
                     tvTxStatus.text = "✕  ${e.message}"; tvTxStatus.setTextColor(c(RED))
                     btnSend.isEnabled = true; btnSend.text = "⚡   TRANSMIT"; pbTx.visibility = View.GONE
                 }
-            } finally { isTransmitting.set(false); stopTorch() }
+            } finally { 
+                isTransmitting.set(false); stopTorch() 
+                Log.d(TAG, "TX: Cleanup done")
+            }
         }
     }
 
     // Re-interrupt the thread so the executor can honour shutdown during a long TX
     private fun sleepUntil(targetMs: Long) {
-        val rem = targetMs - System.currentTimeMillis()
-        if (rem > 0) try { Thread.sleep(rem) }
-        catch (e: InterruptedException) { Thread.currentThread().interrupt() }
+        val now = System.currentTimeMillis()
+        val rem = targetMs - now
+        if (rem > 0) {
+            try { Thread.sleep(rem) }
+            catch (e: InterruptedException) { 
+                Log.w(TAG, "TX: Sleep interrupted")
+                Thread.currentThread().interrupt() 
+            }
+        } else if (rem < -10) {
+            Log.w(TAG, "TX: Timing lag: ${-rem}ms behind schedule")
+        }
     }
 
     private fun torch(on: Boolean) {
@@ -732,14 +785,16 @@ class MainActivity : AppCompatActivity() {
         try {
             camManager?.setTorchMode(torchCamId ?: return, on)
             isTorchOn = on
+            Log.v(TAG, "Hardware: Torch ${if(on) "ON" else "OFF"}")
         } catch (e: CameraAccessException) {
-            Log.e(TAG, "torch: $e")
+            Log.e(TAG, "Hardware: Torch access error", e)
         }
     }
 
     private fun stopTorch() {
+        Log.d(TAG, "Hardware: Emergency torch stop")
         try { torchCamId?.let { camManager?.setTorchMode(it, false) } }
-        catch (_: CameraAccessException) {}
+        catch (e: CameraAccessException) { Log.e(TAG, "Hardware: Torch stop error", e) }
         finally { isTorchOn = false }
     }
 
@@ -750,12 +805,17 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("MissingPermission")
     private fun openCamera() {
         // Prevent double-open if called twice before the first callback fires
-        if (cameraDevice != null) return
-        val id = rxCamId ?: run { Log.e(TAG, "No back cam"); return }
+        if (cameraDevice != null) {
+            Log.d(TAG, "RX: Camera already open")
+            return
+        }
+        val id = rxCamId ?: run { Log.e(TAG, "RX: No back camera ID found"); return }
+        Log.d(TAG, "RX: Opening camera $id")
         closeCam(); cancelReadyCountdown(); decoder.reset()
 
         imageReader = android.media.ImageReader.newInstance(
             320, 240, android.graphics.ImageFormat.YUV_420_888, 4)
+        Log.d(TAG, "RX: ImageReader created 320x240 YUV")
         imageReader!!.setOnImageAvailableListener({ reader ->
             val img = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
             try {
@@ -775,7 +835,7 @@ class MainActivity : AppCompatActivity() {
                 val result = decoder.push(b, System.currentTimeMillis())
 
                 if (result != null) {
-                    Log.d(TAG, "DECODED: $result")
+                    Log.i(TAG, "RX: DECODED MESSAGE: '$result'")
                     val expanded   = CODE_TO_LABEL[result]
                     val displayTxt = if (expanded != null) "[$result]  $expanded" else result
                     val accent     = QUICK_CMDS.firstOrNull { it.second == result }?.third ?: RX
@@ -787,6 +847,7 @@ class MainActivity : AppCompatActivity() {
                         tvState.background = cardDrawable(SURFACE, RX_DIM, 8f)
                     }
                     mainHandler.postDelayed({
+                        Log.d(TAG, "RX: Post-decode reset")
                         decoder.reset(); decoder.markReady()
                         tvDecoded.text = "—"; tvDecoded.setTextColor(c(RX))
                         tvDecoded.background = cardDrawable(SURFACE, RX_DIM, 12f)
@@ -794,6 +855,10 @@ class MainActivity : AppCompatActivity() {
                         tvState.setTextColor(c(RX))
                         tvState.background = cardDrawable(SURFACE, RX_DIM, 8f)
                     }, 4000L)
+                }
+
+                if (decoder.totalFrames % 60L == 0L) {
+                    Log.v(TAG, "RX: Processed ${decoder.totalFrames} frames. Current brightness: ${b.toInt()} State: ${decoder.state}")
                 }
 
                 if (decoder.totalFrames % 2L == 0L) {
@@ -826,25 +891,34 @@ class MainActivity : AppCompatActivity() {
         try {
             camManager!!.openCamera(id, object : CameraDevice.StateCallback() {
                 override fun onOpened(cam: CameraDevice) {
+                    Log.d(TAG, "Hardware: Camera $id opened")
                     cameraDevice = cam; createSession(cam)
                     mainHandler.post { startReadyCountdown(CAM_READY_DELAY_MS) }
                 }
-                override fun onDisconnected(cam: CameraDevice) { cam.close() }
-                override fun onError(cam: CameraDevice, err: Int) { cam.close(); Log.e(TAG, "Cam err $err") }
+                override fun onDisconnected(cam: CameraDevice) { 
+                    Log.w(TAG, "Hardware: Camera $id disconnected")
+                    cam.close() 
+                }
+                override fun onError(cam: CameraDevice, err: Int) { 
+                    Log.e(TAG, "Hardware: Camera $id error: $err")
+                    cam.close(); cameraDevice = null
+                }
             }, cameraHandler)
-        } catch (e: CameraAccessException) { Log.e(TAG, "openCamera: $e") }
+        } catch (e: CameraAccessException) { Log.e(TAG, "Hardware: Failed to open camera", e) }
     }
 
     private fun createSession(cam: CameraDevice) {
         val ps = surfaceView.holder.surface
-        if (ps == null || !ps.isValid) { Log.e(TAG, "preview surface invalid"); return }
+        if (ps == null || !ps.isValid) { Log.e(TAG, "RX: Preview surface invalid"); return }
+        Log.d(TAG, "RX: Creating capture session")
         cam.createCaptureSession(listOf(ps, imageReader!!.surface),
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
+                    Log.d(TAG, "RX: Capture session configured")
                     captureSession = s; startTwoPhaseCapture(cam, s)
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) {
-                    Log.e(TAG, "Session config failed")
+                    Log.e(TAG, "RX: Capture session configuration FAILED")
                 }
             }, cameraHandler)
     }
@@ -853,6 +927,7 @@ class MainActivity : AppCompatActivity() {
         val chars     = camManager!!.getCameraCharacteristics(rxCamId!!)
         val fpsRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
         val bestFps   = fpsRanges?.maxByOrNull { it.upper } ?: Range(15, 30)
+        Log.d(TAG, "RX: Phase 1: Unlocked AE, target FPS range: $bestFps")
         try {
             val u = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 addTarget(surfaceView.holder.surface); addTarget(imageReader!!.surface)
@@ -864,9 +939,15 @@ class MainActivity : AppCompatActivity() {
                     CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
             }
             session.setRepeatingRequest(u.build(), null, cameraHandler)
-        } catch (e: CameraAccessException) { Log.e(TAG, "Phase 1: $e"); startUnlockedCapture(cam, session); return }
+        } catch (e: CameraAccessException) { 
+            Log.e(TAG, "RX: Phase 1 configuration error", e)
+            startUnlockedCapture(cam, session); return 
+        }
+        
         cameraHandler.postDelayed({
+            if (cameraDevice == null || captureSession == null) return@postDelayed
             try {
+                Log.d(TAG, "RX: Phase 2: Locking AE/AWB for stable thresholding")
                 val l = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                     addTarget(surfaceView.holder.surface); addTarget(imageReader!!.surface)
                     set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
@@ -885,23 +966,31 @@ class MainActivity : AppCompatActivity() {
                     set(CaptureRequest.CONTROL_AWB_LOCK, true)
                 }
                 session.setRepeatingRequest(l.build(), null, cameraHandler)
-                Log.d(TAG, "Phase 2: AE locked FPS=$bestFps")
-            } catch (e: CameraAccessException) { Log.e(TAG, "Phase 2: $e"); startUnlockedCapture(cam, session) }
+                Log.d(TAG, "RX: Phase 2 active: AE/AWB locked")
+            } catch (e: CameraAccessException) { 
+                Log.e(TAG, "RX: Phase 2 configuration error", e)
+                startUnlockedCapture(cam, session) 
+            }
         }, 1000L)
     }
 
     private fun startUnlockedCapture(cam: CameraDevice, session: CameraCaptureSession) {
-        val req = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-            addTarget(surfaceView.holder.surface); addTarget(imageReader!!.surface)
+        Log.w(TAG, "RX: Starting unlocked fallback capture")
+        try {
+            val req = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(surfaceView.holder.surface); addTarget(imageReader!!.surface)
+            }
+            session.setRepeatingRequest(req.build(), null, cameraHandler)
+        } catch (e: Exception) {
+            Log.e(TAG, "RX: Fallback capture FAILED", e)
         }
-        session.setRepeatingRequest(req.build(), null, cameraHandler)
-        Log.d(TAG, "Fallback: unlocked capture")
     }
 
     private fun closeCam() {
-        try { captureSession?.close() } catch (_: Exception) {}
-        try { cameraDevice?.close()   } catch (_: Exception) {}
-        try { imageReader?.close()    } catch (_: Exception) {}
+        Log.d(TAG, "RX: Closing camera resources")
+        try { captureSession?.close() } catch (e: Exception) { Log.e(TAG, "RX: Error closing session", e) }
+        try { cameraDevice?.close()   } catch (e: Exception) { Log.e(TAG, "RX: Error closing device", e) }
+        try { imageReader?.close()    } catch (e: Exception) { Log.e(TAG, "RX: Error closing imageReader", e) }
         captureSession = null; cameraDevice = null; imageReader = null
     }
 
@@ -978,6 +1067,7 @@ class MainActivity : AppCompatActivity() {
 
 class NotifActionReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        Log.d("UFlash", "NotifActionReceiver: Received action=${intent.action}")
         context.startActivity(
             Intent(context, MainActivity::class.java).apply {
                 action = intent.action
@@ -1075,18 +1165,21 @@ class SimpleDecoder {
         val isHigh = brightness > threshold
         if (runStartMs == 0L) {
             runIsHigh = isHigh; runStartMs = nowMs
+            Log.v("UFlash", "Decoder: First run start isHigh=$isHigh")
         } else if (isHigh != runIsHigh) {
             val runDur = nowMs - runStartMs
             when (state) {
                 State.RECEIVING -> {
                     if (runDur >= MIN_RUN_MS) {
                         edges.add(Edge(nowMs, isHigh))
-                        Log.d("UFlash", "edge @${nowMs-t0Ms}ms  ${if(isHigh)"HIGH" else "LOW"}  dur=${runDur}ms")
+                        Log.d("UFlash", "Decoder: Edge @${nowMs-t0Ms}ms  ${if(isHigh)"HIGH" else "LOW"}  dur=${runDur}ms (total edges: ${edges.size})")
                     } else {
-                        Log.d("UFlash", "NOISE @${nowMs-t0Ms}ms  dur=${runDur}ms"); return null
+                        Log.v("UFlash", "Decoder: Noise filtered @${nowMs-t0Ms}ms  dur=${runDur}ms"); return null
                     }
                 }
-                else -> {}
+                else -> {
+                    Log.v("UFlash", "Decoder: Transition ${if(runIsHigh)"HIGH->LOW" else "LOW->HIGH"} dur=${runDur}ms state=$state")
+                }
             }
             runIsHigh = isHigh; runStartMs = nowMs
         }
@@ -1095,23 +1188,27 @@ class SimpleDecoder {
             State.IDLE -> {
                 if (isHigh && runDurMs >= START_TRIGGER_MS && (swing >= 12.0 || calibBaseline >= 0)) {
                     state = State.WAIT_FOR_LOW
-                    Log.d("UFlash", "★ START thr=${threshold.toInt()} swing=${swing.toInt()}")
+                    Log.i("UFlash", "Decoder: START sequence detected. thr=${threshold.toInt()} swing=${swing.toInt()}")
                 }
             }
             State.WAIT_FOR_LOW -> {
                 if (!isHigh) {
                     state = State.RECEIVING; t0Ms = nowMs
                     edges.clear(); edges.add(Edge(nowMs, false))
-                    Log.d("UFlash", "★ Data t0=$t0Ms")
+                    Log.i("UFlash", "Decoder: Data reception started at t0=$t0Ms")
                 }
             }
             State.RECEIVING -> {
                 if (!isHigh && runDurMs >= STOP_TRIGGER_MS) {
                     state = State.DONE
-                    Log.d("UFlash", "★ STOP  ${edges.size}edges  lowRun=${runDurMs}ms")
+                    Log.i("UFlash", "Decoder: STOP sequence detected. ${edges.size} edges, final low run=${runDurMs}ms")
                     return decode(runStartMs + BIT_MS)
                 }
-                if ((nowMs - t0Ms) > MAX_RX_TIMEOUT_MS) { state = State.DONE; return decode(nowMs) }
+                if ((nowMs - t0Ms) > MAX_RX_TIMEOUT_MS) { 
+                    state = State.DONE
+                    Log.w("UFlash", "Decoder: RX timeout after ${MAX_RX_TIMEOUT_MS}ms")
+                    return decode(nowMs) 
+                }
             }
             State.DONE -> {}
         }
@@ -1119,36 +1216,57 @@ class SimpleDecoder {
     }
 
     private fun decode(stopMs: Long): String {
-        if (edges.size < 2) return "(too few edges: ${edges.size})"
+        Log.d("UFlash", "Decoder: Decoding ${edges.size} edges")
+        if (edges.size < 2) {
+            Log.w("UFlash", "Decoder: Too few edges to decode (${edges.size})")
+            return "(too few edges: ${edges.size})"
+        }
         val BIT = BIT_MS.toDouble(); val bits = mutableListOf<Int>()
         for (i in 0 until edges.size - 1) {
             val runMs = edges[i+1].ms - edges[i].ms
-            if (runMs < MIN_RUN_MS) continue
+            if (runMs < MIN_RUN_MS) {
+                Log.v("UFlash", "Decoder: Skipping short run $i: ${runMs}ms")
+                continue
+            }
             val nBits = ((runMs + BIT/2) / BIT).toInt().coerceAtLeast(1)
             repeat(nBits) { bits.add(if (edges[i].isHigh) 1 else 0) }
-            Log.d("UFlash", "run $i: ${if(edges[i].isHigh)"HIGH" else "LOW"} ${runMs}ms → $nBits bits")
+            Log.v("UFlash", "Decoder: run $i: ${if(edges[i].isHigh)"HIGH" else "LOW"} ${runMs}ms → $nBits bits")
         }
         if (edges.isNotEmpty()) {
             val lastRunMs = stopMs - edges.last().ms
             if (lastRunMs >= MIN_RUN_MS) {
                 val nBits = ((lastRunMs + BIT/2) / BIT).toInt().coerceAtLeast(0)
                 repeat(nBits) { bits.add(if (edges.last().isHigh) 1 else 0) }
-                Log.d("UFlash", "last run ${lastRunMs}ms → $nBits bits")
+                Log.v("UFlash", "Decoder: last run ${lastRunMs}ms → $nBits bits")
             }
         }
-        Log.d("UFlash", "bits(${bits.size}): ${bits.joinToString("")}")
-        if (bits.size < 10) return "RAW:${bits.joinToString("")} (need ≥10 for 4B5B)"
+        Log.i("UFlash", "Decoder: Extracted bits(${bits.size}): ${bits.joinToString("")}")
+        if (bits.size < 10) {
+            Log.w("UFlash", "Decoder: Not enough bits for 4B5B (need 10, got ${bits.size})")
+            return "RAW:${bits.joinToString("")} (need ≥10 for 4B5B)"
+        }
         val sb = StringBuilder(); var i = 0; var bad = 0
         while (i + 9 < bits.size) {
-            val byte = FourB5B.decodeTenBits(bits.subList(i, i+10))
-            if (byte < 0) { bad++; sb.append("?") }
-            else sb.append(if (byte in 32..126) byte.toChar() else "[$byte]")
+            val symbol = bits.subList(i, i+10)
+            val byte = FourB5B.decodeTenBits(symbol)
+            if (byte < 0) { 
+                bad++
+                sb.append("?") 
+                Log.w("UFlash", "Decoder: Bad 4B5B symbol at bit $i: ${symbol.joinToString("")}")
+            }
+            else {
+                val char = if (byte in 32..126) byte.toChar() else "[$byte]"
+                sb.append(char)
+                Log.d("UFlash", "Decoder: Decoded symbol at bit $i: ${symbol.joinToString("")} → '$char' ($byte)")
+            }
             i += 10
         }
         val leftover = bits.size - i
-        if (leftover > 0) Log.d("UFlash", "leftover $leftover bits")
-        if (bad > 0)      Log.d("UFlash", "$bad bad 4B5B symbol(s)")
-        return sb.toString().ifEmpty { "RAW:${bits.joinToString("")}" }
+        if (leftover > 0) Log.d("UFlash", "Decoder: Leftover $leftover bits")
+        if (bad > 0)      Log.w("UFlash", "Decoder: Finished with $bad bad 4B5B symbol(s)")
+        val finalMsg = sb.toString()
+        Log.i("UFlash", "Decoder: Final decoded string: '$finalMsg'")
+        return finalMsg.ifEmpty { "RAW:${bits.joinToString("")}" }
     }
 }
 
@@ -1168,13 +1286,29 @@ object FourB5B {
     private val DEC = IntArray(32) { -1 }.apply {
         ENC.forEachIndexed { n, code -> this[code] = n }
     }
-    fun encodeByte(byte: Int): List<Int> =
-        nibbleToBits(ENC[(byte shr 4) and 0xF]) + nibbleToBits(ENC[byte and 0xF])
+    fun encodeByte(byte: Int): List<Int> {
+        val hi = (byte shr 4) and 0xF
+        val lo = byte and 0xF
+        val encHi = ENC[hi]
+        val encLo = ENC[lo]
+        Log.v("UFlash", "4B5B: Encoding byte $byte (0x${"%02X".format(byte)}) -> Nibbles [$hi, $lo] -> 4B5B symbols [${"%05b".format(encHi)}, ${"%05b".format(encLo)}]")
+        return nibbleToBits(encHi) + nibbleToBits(encLo)
+    }
     fun decodeTenBits(bits: List<Int>): Int {
         if (bits.size < 10) return -1
-        val hi = DEC[bitsToInt(bits.subList(0, 5))]
-        val lo = DEC[bitsToInt(bits.subList(5, 10))]
-        return if (hi < 0 || lo < 0) -1 else (hi shl 4) or lo
+        val hiBits = bits.subList(0, 5)
+        val loBits = bits.subList(5, 10)
+        val hiSym = bitsToInt(hiBits)
+        val loSym = bitsToInt(loBits)
+        val hi = DEC[hiSym]
+        val lo = DEC[loSym]
+        if (hi < 0 || lo < 0) {
+            Log.v("UFlash", "4B5B: Decoding failed for 10-bits ${bits.joinToString("")}. Symbols: [$hiSym, $loSym] -> Decoded: [$hi, $lo]")
+            return -1
+        }
+        val result = (hi shl 4) or lo
+        Log.v("UFlash", "4B5B: Decoded 10-bits ${bits.joinToString("")} -> Symbols: [$hiSym, $loSym] -> Nibbles: [$hi, $lo] -> Byte: $result (0x${"%02X".format(result)})")
+        return result
     }
     private fun nibbleToBits(code: Int): List<Int> = (4 downTo 0).map { (code shr it) and 1 }
     private fun bitsToInt(bits: List<Int>): Int = bits.fold(0) { acc, b -> (acc shl 1) or b }
