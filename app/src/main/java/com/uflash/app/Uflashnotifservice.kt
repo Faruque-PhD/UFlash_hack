@@ -32,7 +32,20 @@ class UFlashNotifService : Service() {
         android.util.Log.d("UFlashNotif", "Service: onCreate")
         // Create channel first — must exist before any notification is posted
         createChannel()
-...
+
+        // MediaStyle requires a live session token when the notification is built.
+        // Initialize it before startForeground() calls buildNotification().
+        mediaSession = MediaSessionCompat(this, "UFlashNotifService").apply {
+            setPlaybackState(
+                PlaybackStateCompat.Builder()
+                    .setActions(
+                        PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
+                            PlaybackStateCompat.ACTION_PLAY or
+                            PlaybackStateCompat.ACTION_SKIP_TO_NEXT
+                    )
+                    .setState(PlaybackStateCompat.STATE_PLAYING, 0L, 1f)
+                    .build()
+            )
             isActive = true
         }
 
